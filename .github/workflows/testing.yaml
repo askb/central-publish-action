@@ -50,6 +50,7 @@ concurrency:
 
 jobs:
   build:
+    name: 'Build and Publish Test'
     # Runs on push, workflow_dispatch, and same-repo PRs automatically.
     # Fork PRs run only when a maintainer adds the 'safe to test' label
     # (otherwise the job is shown but skipped).

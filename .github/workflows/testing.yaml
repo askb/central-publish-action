@@ -28,15 +28,12 @@ on:
       - "action.yaml"
       - "scripts/**"
       - ".github/workflows/testing.yaml"
-  # Fork PRs cannot access the Central/GPG publishing secrets, so this
-  # suite is shown but skipped on them by default. A maintainer can opt a
-  # fork PR in by applying the 'safe to test' label: the build job then
-  # runs via the 'integration' environment (required reviewers), with the
-  # checkout pinned to the PR head SHA. The workflow definition is always
-  # taken from the base branch; untrusted PR code only runs after approval.
-  pull_request_target:  # zizmor: ignore[dangerous-triggers]
+  # Deliberately pull_request (not pull_request_target): the job checks out
+  # and runs the code under test, so it must stay unprivileged. Fork PRs
+  # therefore receive no secrets and degrade to an unsigned, upload-free
+  # run; see the 'Determine test mode' step below.
+  pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
     paths:
       - "action.yaml"
       - "scripts/**"
@@ -51,23 +48,14 @@ concurrency:
 jobs:
   build:
     name: 'Build and Publish Test'
-    # Runs on push, workflow_dispatch, and same-repo PRs automatically.
-    # Fork PRs run only when a maintainer adds the 'safe to test' label
-    # (otherwise the job is shown but skipped).
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request_target' &&
-       (github.event.pull_request.head.repo.full_name == github.repository ||
-        contains(github.event.pull_request.labels.*.name, 'safe to test')))
-    # Gate fork-PR runs behind the 'integration' environment (required
-    # reviewers). Trusted events (push, dispatch, same-repo PRs) use the
-    # unprotected 'integration-auto' environment, which has no reviewers
-    # and runs without delay.
-    # yamllint disable-line rule:line-length
-    environment: ${{ (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) && 'integration' || 'integration-auto' }}
+    # Scopes the publishing secrets to a dedicated environment. No reviewers
+    # are configured: the trigger is pull_request, so fork PRs never receive
+    # secrets and need no manual gate.
+    environment: integration-auto
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read  # Required to check out the code under test.
     steps:
       # Harden the runner used by this workflow
       # yamllint disable-line rule:line-length
@@ -79,13 +67,58 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # For fork PRs this is the (reviewer-approved) PR head repo and
-          # SHA; for push and same-repo events it falls back to the base
-          # repository and triggering SHA.
-          # yamllint disable-line rule:line-length
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - name: Determine test mode
+        id: mode
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
+          GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
+          DRY_RUN_INPUT: ${{ inputs.dry-run }}
+          ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          # Select signing/upload behaviour based on credential availability.
+          set -euo pipefail
+
+          # A run is entitled to the repository secrets unless it comes from
+          # a fork pull request or from Dependabot (which reads a separate
+          # secret store). PR_HEAD_REPO is empty for non-PR events.
+          credentials_expected='true'
+          if [ "${ACTOR}" = 'dependabot[bot]' ]; then
+            credentials_expected='false'
+          elif [ -n "${PR_HEAD_REPO}" ] &&
+               [ "${PR_HEAD_REPO}" != "${REPOSITORY}" ]; then
+            credentials_expected='false'
+          fi
+
+          # Runs without credentials still exercise the parts of the action
+          # that need none: input validation, checksum generation and bundle
+          # creation.
+          if [ -n "${CENTRAL_USERNAME}" ] && [ -n "${CENTRAL_TOKEN}" ] &&
+             [ -n "${GPG_PRIVATE_KEY_B64}" ]; then
+            signing_method='gpg'
+            dry_run="${DRY_RUN_INPUT:-false}"
+          elif [ "${credentials_expected}" = 'true' ]; then
+            # Never degrade a trusted run to a dry-run: that would hide a
+            # regression in the signing and upload path behind a green tick.
+            echo "::error::Publishing credentials missing for a trusted run;" \
+              "expected CENTRAL_USERNAME, CENTRAL_TOKEN and" \
+              "GPG_PRIVATE_KEY_B64"
+            exit 1
+          else
+            echo "::notice::Publishing credentials unavailable; running an" \
+              "unsigned dry-run (no upload to Central Portal)"
+            signing_method='none'
+            dry_run='true'
+          fi
+
+          echo "Signing method: ${signing_method}"
+          echo "Dry run: ${dry_run}"
+          echo "signing-method=${signing_method}" >> "$GITHUB_OUTPUT"
+          echo "dry-run=${dry_run}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Java
         # yamllint disable-line rule:line-length
@@ -197,5 +230,6 @@ jobs:
           central-username: ${{ secrets.CENTRAL_USERNAME }}
           central-token: ${{ secrets.CENTRAL_TOKEN }}
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
+          signing-method: ${{ steps.mode.outputs.signing-method }}
           publishing-type: ${{ inputs.publishing-type || 'USER_MANAGED' }}
-          dry-run: ${{ inputs.dry-run }}
+          dry-run: ${{ steps.mode.outputs.dry-run }}
